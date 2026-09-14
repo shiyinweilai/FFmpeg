@@ -103,6 +103,15 @@ static void h264_copy_picture_params(H264Picture *dst, const H264Picture *src)
     dst->mb_height     = src->mb_height;
     dst->mb_stride     = src->mb_stride;
     dst->needs_fg      = src->needs_fg;
+
+    /*
+     * PlayerX 定制：同步整帧 sub_mb_type 缓存指针。
+     * cur_pic 由 ff_h264_ref_picture()/replace_picture() 从 cur_pic_ptr 拷贝而来，
+     * 若这里不带过去，解码期 h->cur_pic.sub_mb_type 会是 NULL，
+     * 导致子宏块划分（8x4/4x8/4x4）无法保存。
+     */
+    dst->sub_mb_type_base = src->sub_mb_type_base;
+    dst->sub_mb_type      = src->sub_mb_type;
 }
 
 int ff_h264_ref_picture(H264Picture *dst, const H264Picture *src)

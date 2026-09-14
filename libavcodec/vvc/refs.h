@@ -61,4 +61,12 @@ void ff_vvc_report_frame_finished(VVCFrame *frame);
 void ff_vvc_report_progress(VVCFrame *frame, VVCProgress vp, int y);
 void ff_vvc_add_progress_listener(VVCFrame *frame, VVCProgressListener *l);
 
+/**
+ * PlayerX 定制：导出 VVC 真实 CU 划分 + QP 到 AVFrame 的
+ * AV_FRAME_DATA_VIDEO_ENC_PARAMS 侧数据。
+ * 必须在 CU 数据（fc->tab.cus）释放前调用，即 frame_end() 之前。
+ */
+void ff_vvc_export_enc_params(VVCContext *s, const VVCFrameContext *fc,
+                              const VVCFrame *vf, AVFrame *out);
+
 #endif // AVCODEC_VVC_REFS_H

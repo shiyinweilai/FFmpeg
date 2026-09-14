@@ -159,6 +159,7 @@ void ff_h264_free_tables(H264Context *h)
 
     av_refstruct_pool_uninit(&h->qscale_table_pool);
     av_refstruct_pool_uninit(&h->mb_type_pool);
+    av_refstruct_pool_uninit(&h->sub_mb_type_pool);
     av_refstruct_pool_uninit(&h->motion_val_pool);
     av_refstruct_pool_uninit(&h->ref_index_pool);
 
@@ -878,10 +879,77 @@ end:
 static int h264_export_enc_params(AVFrame *f, const H264Picture *p)
 {
     AVVideoEncParams *par;
-    unsigned int nb_mb = p->mb_height * p->mb_width;
     unsigned int x, y;
 
-    par = av_video_enc_params_create_side_data(f, AV_VIDEO_ENC_PARAMS_H264, nb_mb);
+    /*
+     * ==== PlayerX 定制：导出"真实 CU/宏块子划分" ====
+     *
+     * 原生实现固定为每个宏块输出一个 16x16 块（b->w = b->h = 16），
+     * 因此上层只能画出均匀的宏块网格，看不到宏块内部的真实划分。
+     *
+     * H.264 的真实划分记录在 p->mb_type[mb_xy] 里：
+     *   MB_TYPE_16x16 -> 不划分，1 个 16x16 块
+     *   MB_TYPE_16x8  -> 上下 2 个 16x8 块
+     *   MB_TYPE_8x16  -> 左右 2 个 8x16 块
+     *   MB_TYPE_8x8   -> 4 个 8x8 子块；每个 8x8 还可按 sub_mb_type
+     *                    再细分为 8x8 / 8x4 / 4x8 / 4x4
+     * 这里按真实划分展开，块数相应增加（最多每个宏块 16 个 4x4 块）。
+     *
+     * 注意：AVVideoEncParams 的块数组在 av_video_enc_params_create_side_data()
+     * 时按 nb_blocks 一次性分配，所以必须先算出总块数再分配。
+     */
+
+    /* ---- 第一遍：统计真实划分后的总块数 ---- */
+    unsigned int nb_blocks = 0;
+    for (y = 0; y < (unsigned)p->mb_height; y++)
+        for (x = 0; x < (unsigned)p->mb_width; x++) {
+            const unsigned int mb_xy = y * p->mb_stride + x;
+            const uint32_t mt = p->mb_type ? p->mb_type[mb_xy] : 0;
+
+            /*
+             * 注意：MB_TYPE_INTRA / MB_TYPE_INTRA16x16 是 bit0/bit1，
+             * 与 inter 划分位 MB_TYPE_16x16(bit3) / 16x8(bit4) /
+             * 8x16(bit5) / 8x8(bit6) 完全独立。
+             * I_NxN 宏块只带 MB_TYPE_INTRA(bit0)，不带任何 inter 划分位，
+             * 因此必须先判断帧内，否则会误落到"兜底 16x16"。
+             */
+            if (mt & (MB_TYPE_INTRA4x4 | MB_TYPE_INTRA16x16 | MB_TYPE_INTRA_PCM)) {
+                if (mt & MB_TYPE_INTRA_PCM) {
+                    nb_blocks += 1;                   /* I_PCM：整宏块 */
+                } else if (mt & MB_TYPE_INTRA16x16) {
+                    nb_blocks += 1;                   /* I_16x16：1 个 16x16 */
+                } else if (mt & MB_TYPE_8x8DCT) {
+                    nb_blocks += 4;                   /* I_NxN + 8x8 变换：4 个 8x8 */
+                } else {
+                    nb_blocks += 16;                  /* I_NxN + 4x4 变换：16 个 4x4 */
+                }
+            } else if (mt & MB_TYPE_16x8) {
+                nb_blocks += 2;                       /* 2 个 16x8 */
+            } else if (mt & MB_TYPE_8x16) {
+                nb_blocks += 2;                       /* 2 个 8x16 */
+            } else if (mt & MB_TYPE_8x8) {
+                /*
+                 * PlayerX 定制：4 个 8x8 子块，每个再按 sub_mb_type 细分：
+                 *   SUB_8X8 -> 1 个 8x8
+                 *   SUB_8X4 -> 2 个 8x4
+                 *   SUB_4X8 -> 2 个 4x8
+                 *   SUB_4X4 -> 4 个 4x4
+                 * sub_mb_type 来自整帧缓存 p->sub_mb_type[mb_xy*4 + i]。
+                 */
+                for (int i = 0; i < 4; i++) {
+                    const uint16_t smt = p->sub_mb_type
+                                         ? p->sub_mb_type[mb_xy * 4u + i] : 0;
+                    if (smt & MB_TYPE_8x8)       nb_blocks += 4;   /* 4x4 */
+                    else if (smt & MB_TYPE_16x8) nb_blocks += 2;   /* 8x4 (bit 复用) */
+                    else if (smt & MB_TYPE_8x16) nb_blocks += 2;   /* 4x8 (bit 复用) */
+                    else                         nb_blocks += 1;   /* 8x8 */
+                }
+            } else {
+                nb_blocks += 1;                       /* MB_TYPE_16x16 / 兜底 */
+            }
+        }
+
+    par = av_video_enc_params_create_side_data(f, AV_VIDEO_ENC_PARAMS_H264, nb_blocks);
     if (!par)
         return AVERROR(ENOMEM);
 
@@ -892,18 +960,146 @@ static int h264_export_enc_params(AVFrame *f, const H264Picture *p)
     par->delta_qp[2][0] = p->pps->chroma_qp_index_offset[1];
     par->delta_qp[2][1] = p->pps->chroma_qp_index_offset[1];
 
-    for (y = 0; y < p->mb_height; y++)
-        for (x = 0; x < p->mb_width; x++) {
-            const unsigned int block_idx = y * p->mb_width + x;
-            const unsigned int     mb_xy = y * p->mb_stride + x;
-            AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx);
+    /* ---- 第二遍：按真实划分写入每个子块 ---- */
+    unsigned int block_idx = 0;
+    for (y = 0; y < (unsigned)p->mb_height; y++)
+        for (x = 0; x < (unsigned)p->mb_width; x++) {
+            const unsigned int mb_xy = y * p->mb_stride + x;
+            const uint32_t mt = p->mb_type ? p->mb_type[mb_xy] : 0;
 
-            b->src_x = x * 16;
-            b->src_y = y * 16;
-            b->w     = 16;
-            b->h     = 16;
+            /* 该宏块的 QP（同一宏块内所有子块共享，H.264 以宏块为 QP 单位） */
+            const int mb_qp = p->qscale_table ? p->qscale_table[mb_xy] : par->qp;
+            const int dqp = mb_qp - par->qp;
 
-            b->delta_qp = p->qscale_table[mb_xy] - par->qp;
+            /* 基础坐标 */
+            const int bx = x * 16;
+            const int by = y * 16;
+
+            /* 帧内宏块：先判断（INTRA 位与 inter 划分位独立） */
+            if (mt & (MB_TYPE_INTRA4x4 | MB_TYPE_INTRA16x16 | MB_TYPE_INTRA_PCM)) {
+                if (mt & MB_TYPE_INTRA_PCM) {
+                    /* I_PCM：原始采样，整宏块 1 块 */
+                    AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+                    b->src_x = bx;  b->src_y = by;
+                    b->w = 16;      b->h = 16;
+                    b->delta_qp = 0;
+                } else if (mt & MB_TYPE_INTRA16x16) {
+                    /* I_16x16：1 个 16x16 帧内块 */
+                    AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+                    b->src_x = bx;  b->src_y = by;
+                    b->w = 16;      b->h = 16;
+                    b->delta_qp = dqp;
+                } else if (mt & MB_TYPE_8x8DCT) {
+                    /* I_NxN + 8x8 变换：4 个 8x8 */
+                    for (int i = 0; i < 4; i++) {
+                        AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+                        b->src_x = bx + (i & 1) * 8;
+                        b->src_y = by + (i >> 1) * 8;
+                        b->w = 8;   b->h = 8;
+                        b->delta_qp = dqp;
+                    }
+                } else {
+                    /* I_NxN + 4x4 变换：16 个 4x4（4x4 网格） */
+                    for (int i = 0; i < 16; i++) {
+                        AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+                        b->src_x = bx + (i & 3) * 4;
+                        b->src_y = by + (i >> 2) * 4;
+                        b->w = 4;   b->h = 4;
+                        b->delta_qp = dqp;
+                    }
+                }
+            } else if (mt & MB_TYPE_16x8) {
+                /* 上下两个 16x8 */
+                for (int i = 0; i < 2; i++) {
+                    AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+                    b->src_x = bx;
+                    b->src_y = by + i * 8;
+                    b->w     = 16;
+                    b->h     = 8;
+                    b->delta_qp = dqp;
+                }
+            } else if (mt & MB_TYPE_8x16) {
+                /* 左右两个 8x16 */
+                for (int i = 0; i < 2; i++) {
+                    AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+                    b->src_x = bx + i * 8;
+                    b->src_y = by;
+                    b->w     = 8;
+                    b->h     = 16;
+                    b->delta_qp = dqp;
+                }
+            } else if (mt & MB_TYPE_8x8) {
+                /*
+                 * PlayerX 定制：4 个 8x8 子块（2x2 排布），每个按 sub_mb_type
+                 * 展开为真实的 8x8 / 8x4 / 4x8 / 4x4 子划分。
+                 * sub_mb_type 的划分位是"复用"的（见 h264dec.h）：
+                 *   IS_SUB_8X8 -> MB_TYPE_16x16(bit3)
+                 *   IS_SUB_8X4 -> MB_TYPE_16x8 (bit4)
+                 *   IS_SUB_4X8 -> MB_TYPE_8x16 (bit5)
+                 *   IS_SUB_4X4 -> MB_TYPE_8x8  (bit6)
+                 * 注意：IS_SUB_4X4 用的是 MB_TYPE_8x8 位，而 IS_SUB_8X8 用的是
+                 * MB_TYPE_16x16 位，二者不可按数值大小比较，必须逐位判断。
+                 */
+                for (int i = 0; i < 4; i++) {
+                    /* 该 8x8 子块在宏块内的左上角坐标 */
+                    const int sx = (i & 1) * 8;
+                    const int sy = (i >> 1) * 8;
+                    const uint16_t smt = p->sub_mb_type
+                                         ? p->sub_mb_type[mb_xy * 4u + i] : 0;
+
+                    if (smt & MB_TYPE_8x8) {
+                        /* SUB_4X4：4 个 4x4（2x2） */
+                        for (int j = 0; j < 4; j++) {
+                            AVVideoBlockParams *b =
+                                av_video_enc_params_block(par, block_idx++);
+                            b->src_x = bx + sx + (j & 1) * 4;
+                            b->src_y = by + sy + (j >> 1) * 4;
+                            b->w     = 4;
+                            b->h     = 4;
+                            b->delta_qp = dqp;
+                        }
+                    } else if (smt & MB_TYPE_16x8) {
+                        /* SUB_8X4：上下 2 个 8x4 */
+                        for (int j = 0; j < 2; j++) {
+                            AVVideoBlockParams *b =
+                                av_video_enc_params_block(par, block_idx++);
+                            b->src_x = bx + sx;
+                            b->src_y = by + sy + j * 4;
+                            b->w     = 8;
+                            b->h     = 4;
+                            b->delta_qp = dqp;
+                        }
+                    } else if (smt & MB_TYPE_8x16) {
+                        /* SUB_4X8：左右 2 个 4x8 */
+                        for (int j = 0; j < 2; j++) {
+                            AVVideoBlockParams *b =
+                                av_video_enc_params_block(par, block_idx++);
+                            b->src_x = bx + sx + j * 4;
+                            b->src_y = by + sy;
+                            b->w     = 4;
+                            b->h     = 8;
+                            b->delta_qp = dqp;
+                        }
+                    } else {
+                        /* SUB_8X8：1 个 8x8 */
+                        AVVideoBlockParams *b =
+                            av_video_enc_params_block(par, block_idx++);
+                        b->src_x = bx + sx;
+                        b->src_y = by + sy;
+                        b->w     = 8;
+                        b->h     = 8;
+                        b->delta_qp = dqp;
+                    }
+                }
+            } else {
+                /* MB_TYPE_16x16（inter 不划分）/ 兜底：一个 16x16 块 */
+                AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+                b->src_x = bx;
+                b->src_y = by;
+                b->w     = 16;
+                b->h     = 16;
+                b->delta_qp = dqp;
+            }
         }
 
     return 0;

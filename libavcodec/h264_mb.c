@@ -804,6 +804,20 @@ void ff_h264_hl_decode_mb(const H264Context *h, H264SliceContext *sl)
     int is_complex    = CONFIG_SMALL || sl->is_complex ||
                         IS_INTRA_PCM(mb_type) || sl->qscale == 0;
 
+    /*
+     * PlayerX 定制：保存本宏块的 sub_mb_type 到整帧缓存。
+     * sl->sub_mb_type[4] 由熵解码（CAVLC/CABAC）在此前已填好，
+     * 但它是单宏块临时量，下一个宏块即被覆盖，故这里按 mb_xy 存下来，
+     * 供 output_frame -> h264_export_enc_params() 展开 8x8/8x4/4x8/4x4。
+     */
+    if (h->cur_pic.sub_mb_type && mb_xy >= 0) {
+        uint16_t *dst = h->cur_pic.sub_mb_type + (unsigned)mb_xy * 4u;
+        dst[0] = sl->sub_mb_type[0];
+        dst[1] = sl->sub_mb_type[1];
+        dst[2] = sl->sub_mb_type[2];
+        dst[3] = sl->sub_mb_type[3];
+    }
+
     if (CHROMA444(h)) {
         if (is_complex || h->pixel_shift)
             hl_decode_mb_444_complex(h, sl);

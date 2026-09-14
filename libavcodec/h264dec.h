@@ -124,6 +124,16 @@ typedef struct H264Picture {
     uint32_t *mb_type_base;           ///< RefStruct reference
     uint32_t *mb_type;
 
+    /**
+     * PlayerX 定制：整帧缓存每个宏块的 sub_mb_type（每个宏块 4 个 8x8 子块）。
+     * 原生 sub_mb_type 只存在于 H264SliceContext（单宏块临时量，解码即被覆盖），
+     * 无法在 output_frame 阶段回溯。这里按整帧缓存，供
+     * h264_export_enc_params() 展开真实的 8x8/8x4/4x8/4x4 子宏块划分。
+     * 每个宏块 4 个 uint16_t（下标 0..3 对应 2x2 排布的 8x8 子块）。
+     */
+    uint16_t *sub_mb_type_base;       ///< RefStruct reference
+    uint16_t *sub_mb_type;
+
     /// RefStruct reference for hardware accelerator private data
     void *hwaccel_picture_private;
 
@@ -578,6 +588,8 @@ typedef struct H264Context {
 
     struct AVRefStructPool *qscale_table_pool;
     struct AVRefStructPool *mb_type_pool;
+    /** PlayerX 定制：整帧 sub_mb_type 缓存池（每帧 mb_num * 4 个 uint16_t） */
+    struct AVRefStructPool *sub_mb_type_pool;
     struct AVRefStructPool *motion_val_pool;
     struct AVRefStructPool *ref_index_pool;
     struct AVRefStructPool *decode_error_flags_pool;

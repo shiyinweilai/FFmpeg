@@ -172,13 +172,17 @@ static int init_table_pools(H264Context *h)
     h->motion_val_pool   = av_refstruct_pool_alloc(2 * (b4_array_size + 4) *
                                                    sizeof(int16_t), 0);
     h->ref_index_pool    = av_refstruct_pool_alloc(4 * mb_array_size, 0);
+    /* PlayerX 定制：整帧 sub_mb_type 缓存（每宏块 4 个 uint16_t） */
+    h->sub_mb_type_pool  = av_refstruct_pool_alloc((big_mb_num + h->mb_stride) *
+                                                   4 * sizeof(uint16_t), 0);
 
     if (!h->qscale_table_pool || !h->mb_type_pool || !h->motion_val_pool ||
-        !h->ref_index_pool) {
+        !h->ref_index_pool || !h->sub_mb_type_pool) {
         av_refstruct_pool_uninit(&h->qscale_table_pool);
         av_refstruct_pool_uninit(&h->mb_type_pool);
         av_refstruct_pool_uninit(&h->motion_val_pool);
         av_refstruct_pool_uninit(&h->ref_index_pool);
+        av_refstruct_pool_uninit(&h->sub_mb_type_pool);
         return AVERROR(ENOMEM);
     }
 
@@ -245,11 +249,15 @@ static int alloc_picture(H264Context *h, H264Picture *pic)
 
     pic->qscale_table_base = av_refstruct_pool_get(h->qscale_table_pool);
     pic->mb_type_base      = av_refstruct_pool_get(h->mb_type_pool);
-    if (!pic->qscale_table_base || !pic->mb_type_base)
+    /* PlayerX 定制：整帧 sub_mb_type 缓存（每宏块 4 个 uint16_t） */
+    pic->sub_mb_type_base  = av_refstruct_pool_get(h->sub_mb_type_pool);
+    if (!pic->qscale_table_base || !pic->mb_type_base || !pic->sub_mb_type_base)
         goto fail;
 
     pic->mb_type      = pic->mb_type_base + 2 * h->mb_stride + 1;
     pic->qscale_table = pic->qscale_table_base + 2 * h->mb_stride + 1;
+    /* 与 mb_type 相同偏移，保证 sub_mb_type[mb_xy*4] 对齐同一宏块编号 */
+    pic->sub_mb_type  = pic->sub_mb_type_base + (2 * h->mb_stride + 1) * 4;
 
     for (i = 0; i < 2; i++) {
         pic->motion_val_base[i] = av_refstruct_pool_get(h->motion_val_pool);

@@ -21,7 +21,10 @@
  */
 
 #include "libavutil/error.h"
+#include "libavutil/mem.h"
 #include "libavutil/refstruct.h"
+
+#include "libavcodec/avcodec.h"
 
 #include "cabac.h"
 #include "ctu.h"
@@ -1253,6 +1256,37 @@ static CodingUnit* add_cu(VVCLocalContext *lc, const int x0, const int y0,
     cu->pu.dmvr_flag = 0;
 
     set_cb_pos(fc, cu);
+
+    /* PlayerX: record leaf CU for later export (only luma-related trees,
+     * matching vvdec chType=0 / VQ luma partition view).
+     * Gated by AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS so that only the
+     * bitstream-analysis path (which sets this flag) pays the cost;
+     * plain playback / compare (rb_decoder, no flag) skips it entirely. */
+    if (tree_type != DUAL_TREE_CHROMA && fc->ref) {
+        const AVCodecContext *avctx = (const AVCodecContext *)fc->log_ctx;
+        const int want_snap = avctx &&
+            (avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS);
+        if (want_snap) {
+        VVCFrame *vf = fc->ref;
+        if (vf->nb_cu_snap >= vf->cu_snap_cap) {
+            int   ncap = vf->cu_snap_cap ? vf->cu_snap_cap * 2 : 4096;
+            void *p    = av_realloc(vf->cu_snap, ncap * sizeof(*vf->cu_snap));
+            if (p) {
+                vf->cu_snap    = p;
+                vf->cu_snap_cap = ncap;
+            }
+        }
+        if (vf->cu_snap && vf->nb_cu_snap < vf->cu_snap_cap) {
+            struct VVCCUInfo *ci = &vf->cu_snap[vf->nb_cu_snap++];
+            ci->x         = cu->x0;
+            ci->y         = cu->y0;
+            ci->w         = cu->cb_width;
+            ci->h         = cu->cb_height;
+            ci->depth     = cqt_depth;
+            ci->tree_type = tree_type;
+        }
+        }
+    }
     return cu;
 }
 

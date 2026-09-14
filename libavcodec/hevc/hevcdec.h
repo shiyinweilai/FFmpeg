@@ -378,6 +378,18 @@ typedef struct HEVCFrame {
 
     void *hwaccel_picture_private; ///< RefStruct reference
 
+    /* PlayerX: per-picture leaf-CU partition snapshot for bitstream analysis.
+     * HEVC CUs are pure quadtree (always square cb_size x cb_size). Gated at
+     * capture time by AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS so plain playback
+     * pays nothing. */
+    struct HEVCCUInfo {
+        int16_t x, y;
+        int16_t w, h;
+        int8_t  depth;
+    } *cu_snap;
+    int  nb_cu_snap;
+    int  cu_snap_cap;
+
     // for secondary-layer frames, this is the DPB index of the base-layer frame
     // from the same AU, if it exists, otherwise -1
     int base_layer_frame;
@@ -686,6 +698,10 @@ int ff_hevc_output_frames(HEVCContext *s,
                           unsigned max_output, unsigned max_dpb, int discard);
 
 void ff_hevc_unref_frame(HEVCFrame *frame, int flags);
+
+/* PlayerX: attach leaf-CU partition side data to the output AVFrame. */
+void ff_hevc_export_cu_partition(HEVCContext *s, const HEVCFrame *frame,
+                                 AVFrame *out);
 
 void ff_hevc_set_neighbour_available(HEVCLocalContext *lc, int x0, int y0,
                                      int nPbW, int nPbH, int log2_ctb_size);

@@ -254,9 +254,11 @@ typedef struct VVCSH {
     DBParams deblock;
 
     // partition constrains
-    uint8_t  min_qt_size[2];                                ///< MinQtSizeY, MinQtSizeC
-    uint8_t  max_bt_size[2];                                ///< MaxBtSizeY, MaxBtSizeC
-    uint8_t  max_tt_size[2];                                ///< MaxTtSizeY, MaxTtSizeC
+    /* PlayerX 修复: 原为 uint8_t, 1<<(min_qt_log2+diff) 可达 256+ 导致截断为 0,
+     * 使 can_split 误禁 MTT(BT/TT), 128x128 无法细分。改为 uint16_t。 */
+    uint16_t min_qt_size[2];                                ///< MinQtSizeY, MinQtSizeC
+    uint16_t max_bt_size[2];                                ///< MaxBtSizeY, MaxBtSizeC
+    uint16_t max_tt_size[2];                                ///< MaxTtSizeY, MaxTtSizeC
     uint8_t  max_mtt_depth[2];                              ///< MaxMttDepthY, MaxMttDepthC
     uint8_t  cu_qp_delta_subdiv;                            ///< CuQpDeltaSubdiv
     uint8_t  cu_chroma_qp_offset_subdiv;                    ///< CuChromaQpOffsetSubdiv

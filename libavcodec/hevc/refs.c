@@ -24,6 +24,7 @@
 #include "libavutil/container_fifo.h"
 #include "libavutil/mem.h"
 #include "libavutil/stereo3d.h"
+#include "libavutil/video_enc_params.h"   /* PlayerX: HEVC 块级划分导出 */
 
 #include "libavcodec/decode.h"
 #include "hevc.h"
@@ -51,6 +52,47 @@ void ff_hevc_unref_frame(HEVCFrame *frame, int flags)
         frame->nb_rpl_elems = 0;
         av_refstruct_unref(&frame->rpl_tab);
         frame->refPicList = NULL;
+
+        /* PlayerX: release per-picture CU snapshot */
+        av_freep(&frame->cu_snap);
+        frame->nb_cu_snap  = 0;
+        frame->cu_snap_cap = 0;
+    }
+}
+
+/* PlayerX: export HEVC leaf-CU partition as AV_VIDEO_ENC_PARAMS side data,
+ * mirroring the VVC path. Only invoked when the bitstream-analysis decoder
+ * enabled AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS, and only when a snapshot
+ * was actually captured. delta_qp is left 0 (partition-only view).
+ * Called from hevc_frame_end() after the picture is fully decoded so the
+ * snapshot is complete. */
+void ff_hevc_export_cu_partition(HEVCContext *s, const HEVCFrame *frame,
+                                 AVFrame *out)
+{
+    unsigned int nb_blocks;
+    AVVideoEncParams *par;
+
+    if (!s->avctx ||
+        !(s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS))
+        return;
+    if (!frame || frame->nb_cu_snap <= 0 || !frame->cu_snap)
+        return;
+
+    nb_blocks = frame->nb_cu_snap;
+    par = av_video_enc_params_create_side_data(
+              out, AV_VIDEO_ENC_PARAMS_H264, nb_blocks);
+    if (!par)
+        return;
+
+    par->qp = 0;
+    for (unsigned int i = 0; i < nb_blocks; i++) {
+        const struct HEVCCUInfo *ci = &frame->cu_snap[i];
+        AVVideoBlockParams *b = av_video_enc_params_block(par, i);
+        b->src_x    = ci->x;
+        b->src_y    = ci->y;
+        b->w        = ci->w;
+        b->h        = ci->h;
+        b->delta_qp = 0;
     }
 }
 
@@ -116,6 +158,9 @@ static HEVCFrame *alloc_frame(HEVCContext *s, HEVCLayerContext *l)
         HEVCFrame *frame = &l->DPB[i];
         if (frame->f)
             continue;
+
+        /* PlayerX: ensure snapshot starts empty for this fresh picture */
+        frame->nb_cu_snap = 0;
 
         ret = ff_progress_frame_alloc(s->avctx, &frame->tf);
         if (ret < 0)
@@ -268,6 +313,13 @@ int ff_hevc_output_frames(HEVCContext *s,
                           unsigned layers_active_decode, unsigned layers_active_output,
                           unsigned max_output, unsigned max_dpb, int discard)
 {
+    /* PlayerX: when exporting CU partition, the current in-progress frame has
+     * not been decoded (CU snapshot not captured) yet at frame_start time.
+     * Defer its output until frame_end so the side data lands on it. */
+    const int defer_export =
+        s->avctx &&
+        (s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS);
+
     while (1) {
         int nb_dpb[HEVC_VPS_MAX_LAYERS] = { 0 };
         int nb_output = 0;
@@ -283,6 +335,10 @@ int ff_hevc_output_frames(HEVCContext *s,
 
             for (int i = 0; i < FF_ARRAY_ELEMS(l->DPB); i++) {
                 HEVCFrame *frame = &l->DPB[i];
+                /* skip the still-decoding current frame in export mode */
+                if (defer_export && frame == s->cur_frame &&
+                    frame->nb_cu_snap == 0)
+                    continue;
                 if (frame->flags & HEVC_FRAME_FLAG_OUTPUT) {
                     // nb_output counts AUs with an output-pending frame
                     // in at least one layer
@@ -310,6 +366,11 @@ int ff_hevc_output_frames(HEVCContext *s,
                 if (frame->flags & HEVC_FRAME_FLAG_CORRUPT)
                     f->flags |= AV_FRAME_FLAG_CORRUPT;
                 f->pkt_dts = s->pkt_dts;
+                /* PlayerX: attach CU partition side data to the exact frame
+                 * being output, right before it enters the fifo. Doing it
+                 * here (instead of hevc_frame_end) guarantees the snapshot is
+                 * complete and lands on the frame handed to the user. */
+                ff_hevc_export_cu_partition(s, frame, f);
                 ret = av_container_fifo_write(s->output_fifo, f, AV_CONTAINER_FIFO_FLAG_REF);
             }
             ff_hevc_unref_frame(frame, HEVC_FRAME_FLAG_OUTPUT);

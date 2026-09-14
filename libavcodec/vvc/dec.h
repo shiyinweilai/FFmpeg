@@ -97,6 +97,18 @@ typedef struct VVCFrame {
 
     struct FrameProgress *progress;             ///< RefStruct reference
 
+    /* PlayerX: per-picture leaf-CU partition snapshot.
+     * Stored on the DPB frame (not VVCFrameContext) because the frame
+     * context is recycled between pictures while output is delayed. */
+    struct VVCCUInfo {
+        int16_t x, y;
+        int16_t w, h;
+        int8_t  depth;
+        int8_t  tree_type;
+    } *cu_snap;
+    int  nb_cu_snap;
+    int  cu_snap_cap;
+
     /**
      * A sequence counter, so that old frames are output first
      * after a POC reset

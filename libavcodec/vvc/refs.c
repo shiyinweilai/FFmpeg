@@ -26,6 +26,8 @@
 #include "libavutil/mem.h"
 #include "libavutil/thread.h"
 #include "libavutil/refstruct.h"
+#include "libavutil/video_enc_params.h"   /* PlayerX 定制：VVC 块级导出 */
+#include "libavcodec/vvc/ctu.h"           /* PlayerX 定制：CodingUnit 定义 */
 #include "libavcodec/thread.h"
 #include "libavcodec/decode.h"
 
@@ -67,6 +69,11 @@ void ff_vvc_unref_frame(VVCFrameContext *fc, VVCFrame *frame, int flags)
         av_refstruct_unref(&frame->rpl);
         frame->nb_rpl_elems = 0;
         av_refstruct_unref(&frame->rpl_tab);
+
+        /* PlayerX: release partition snapshot */
+        av_freep(&frame->cu_snap);
+        frame->nb_cu_snap  = 0;
+        frame->cu_snap_cap = 0;
 
         frame->collocated_ref = NULL;
         av_refstruct_unref(&frame->hwaccel_picture_private);
@@ -248,6 +255,10 @@ int ff_vvc_set_new_ref(VVCContext *s, VVCFrameContext *fc, AVFrame **frame)
     *frame = ref->frame;
     fc->ref = ref;
 
+    /* PlayerX: start a fresh partition snapshot for this picture
+     * (reuse previously allocated buffer if any) */
+    ref->nb_cu_snap = 0;
+
     if (s->no_output_before_recovery_flag && (IS_RASL(s) || !GDR_IS_RECOVERED(s)))
         ref->flags = VVC_FRAME_FLAG_SHORT_REF;
     else if (ph->r->ph_pic_output_flag)
@@ -264,6 +275,138 @@ int ff_vvc_set_new_ref(VVCContext *s, VVCFrameContext *fc, AVFrame **frame)
     ref->frame->crop_bottom = fc->ps.pps->r->pps_conf_win_bottom_offset << fc->ps.sps->vshift[CHROMA];
 
     return 0;
+}
+
+/*
+ * PlayerX 定制：导出 VVC（H.266）真实 CU 划分 + QP。
+ *
+ * VVC 的编码单元是 CTU（CtbSizeY，通常 64 或 128），内部可用
+ * 四叉树 + 多类型树（MTT）递归划分为各种矩形 CU，尺寸远丰富于 H.264
+ * （如 64x64 / 32x16 / 8x128 / 4x4 等，含非方形）。
+ *
+ * 数据来源（出帧时 fc->tab 仍有效）：
+ *   fc->tab.cus[rs]  —— 每个 CTU 的 CodingUnit 链表（cu->next 串联）
+ *   cu->x0 / y0      —— 亮度像素坐标（CU 左上角）
+ *   cu->cb_width / cb_height —— CU 尺寸
+ *   fc->tab.qp[LUMA] —— 按 min_cb（4x4）为单位索引的亮度 QP
+ *
+ * 复用与 H.264 相同的 AV_FRAME_DATA_VIDEO_ENC_PARAMS 管线，
+ * 上层 RBBlockAnalyzer 无需改逻辑即可显示（已尺寸无关）。
+ * 注意：AVVideoEncParamsType 目前无 VVC 枚举，暂用 H264 容器，
+ * 上层仅读取块坐标/尺寸/delta_qp，不区分 type。
+ */
+void ff_vvc_export_enc_params(VVCContext *s, const VVCFrameContext *fc,
+                              const VVCFrame *vf, AVFrame *out)
+{
+    const VVCSPS *sps = fc->ps.sps;
+    const VVCPPS *pps = fc->ps.pps;
+    unsigned int nb_blocks = 0;
+    AVVideoEncParams *par;
+    unsigned int block_idx = 0;
+    const int ctu_count    = fc->tab.sz.ctu_count;
+    /* 亮度 QP 按 min_cb（4x4）网格索引 */
+    const int min_cb_log2  = sps ? sps->min_cb_log2_size_y : 2;
+    const int min_cb_width = pps ? pps->min_cb_width : 0;
+    int frame_qp           = 0;
+
+    if (!sps || !pps || !fc->tab.cus || !fc->tab.qp[LUMA] || ctu_count <= 0)
+        return;
+
+    /* PlayerX: the picture being output may be a VVCFrame owned by a different
+     * frame context than the one that decoded it (multiple s->fcs run in
+     * parallel, each with its own DPB). The snapshot was written on the
+     * decoding fc's frame, so locate the frame carrying the snapshot by POC
+     * across all frame contexts. */
+    if ((!vf || vf->nb_cu_snap == 0) && s && s->fcs) {
+        const int want_poc = vf ? vf->poc : INT_MIN;
+        for (int f = 0; f < s->nb_fcs && want_poc != INT_MIN; f++) {
+            const VVCFrameContext *cand = &s->fcs[f];
+            for (int i = 0; i < FF_ARRAY_ELEMS(cand->DPB); i++) {
+                const VVCFrame *df = &cand->DPB[i];
+                if (df->poc == want_poc && df->nb_cu_snap > 0 && df->cu_snap) {
+                    vf = df;
+                    break;
+                }
+            }
+            if (vf && vf->nb_cu_snap > 0)
+                break;
+        }
+    }
+
+    /* CU 重建：优先使用 add_cu 阶段记录的叶子快照（出帧后仍有效，
+     * 覆盖 I 帧 dual tree 隐式 QT 之后的完整细分，与 vvdec/VQ 一致）。
+     * 若快照不可用（异常路径），回退到 cb_width/cb_height 网格反推。 */
+    if (vf && vf->nb_cu_snap > 0 && vf->cu_snap) {
+        nb_blocks = vf->nb_cu_snap;
+        if (!nb_blocks)
+            return;
+
+        par = av_video_enc_params_create_side_data(
+                  out, AV_VIDEO_ENC_PARAMS_H264, nb_blocks);
+        if (!par)
+            return;
+
+        frame_qp = fc->tab.qp[LUMA][0];
+        par->qp  = frame_qp;
+
+        for (int i = 0; i < nb_blocks; i++) {
+            const struct VVCCUInfo *ci = &vf->cu_snap[i];
+            AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+            /* QP 按 min_cb(4x4) 网格取该 CU 左上角所属格 */
+            const int qx = pps ? (ci->x >> min_cb_log2) : 0;
+            const int qy = pps ? (ci->y >> min_cb_log2) : 0;
+            const int q  = (pps && fc->tab.qp[LUMA] &&
+                            qx < min_cb_width) ?
+                           fc->tab.qp[LUMA][qx + qy * min_cb_width] : frame_qp;
+            b->src_x    = ci->x;
+            b->src_y    = ci->y;
+            b->w        = ci->w;
+            b->h        = ci->h;
+            b->delta_qp = q - frame_qp;
+        }
+        return;
+    } else {
+        const int min_cb_w  = pps->min_cb_width;
+        const int min_cb_h  = pps->min_cb_height;
+        const int unit      = 1 << min_cb_log2;   /* 通常 4 */
+
+        for (int ycb = 0; ycb < min_cb_h; ycb++) {
+            for (int xcb = 0; xcb < min_cb_w; xcb++) {
+                const int w = SAMPLE_CTB(fc->tab.cb_width[LUMA],  xcb, ycb);
+                const int h = SAMPLE_CTB(fc->tab.cb_height[LUMA], xcb, ycb);
+                if (w > 0 && h > 0 &&
+                    (xcb * unit) % w == 0 && (ycb * unit) % h == 0)
+                    nb_blocks++;
+            }
+        }
+        if (!nb_blocks)
+            return;
+
+        par = av_video_enc_params_create_side_data(
+                  out, AV_VIDEO_ENC_PARAMS_H264, nb_blocks);
+        if (!par)
+            return;
+
+        frame_qp = fc->tab.qp[LUMA][0];
+        par->qp  = frame_qp;
+
+        for (int ycb = 0; ycb < min_cb_h && block_idx < nb_blocks; ycb++) {
+            for (int xcb = 0; xcb < min_cb_w && block_idx < nb_blocks; xcb++) {
+                const int w = SAMPLE_CTB(fc->tab.cb_width[LUMA],  xcb, ycb);
+                const int h = SAMPLE_CTB(fc->tab.cb_height[LUMA], xcb, ycb);
+                if (w > 0 && h > 0 &&
+                    (xcb * unit) % w == 0 && (ycb * unit) % h == 0) {
+                    AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
+                    const int q = fc->tab.qp[LUMA][xcb + ycb * min_cb_w];
+                    b->src_x    = xcb * unit;
+                    b->src_y    = ycb * unit;
+                    b->w        = w;
+                    b->h        = h;
+                    b->delta_qp = q - frame_qp;
+                }
+            }
+        }
+    }
 }
 
 int ff_vvc_output_frame(VVCContext *s, VVCFrameContext *fc, AVFrame *out, const int no_output_of_prior_pics_flag, int flush)
@@ -311,6 +454,12 @@ int ff_vvc_output_frame(VVCContext *s, VVCFrameContext *fc, AVFrame *out, const 
 
             if (!ret && !(s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN))
                 av_frame_remove_side_data(out, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
+
+            /* PlayerX: export real VVC CU partition to the frame actually
+             * being output, right after the picture is selected and ref'd. */
+            if (!ret &&
+                (s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS))
+                ff_vvc_export_enc_params(s, fc, frame, out);
 
             if (frame->flags & VVC_FRAME_FLAG_BUMPING)
                 ff_vvc_unref_frame(fc, frame, VVC_FRAME_FLAG_OUTPUT | VVC_FRAME_FLAG_BUMPING);

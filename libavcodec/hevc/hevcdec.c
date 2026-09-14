@@ -2454,6 +2454,31 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
     int qp_block_mask    = (1 << (sps->log2_ctb_size - pps->diff_cu_qp_delta_depth)) - 1;
     int x, y, ret;
 
+    /* PlayerX: record this leaf CU (square cb_size x cb_size) for bitstream
+     * analysis export. Gated by AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS so that
+     * plain playback / compare paths (which do not set the flag) skip it. */
+    if (s->avctx &&
+        (s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS) &&
+        s->cur_frame) {
+        HEVCFrame *hf = s->cur_frame;
+        if (hf->nb_cu_snap >= hf->cu_snap_cap) {
+            int   ncap = hf->cu_snap_cap ? hf->cu_snap_cap * 2 : 4096;
+            void *p    = av_realloc(hf->cu_snap, ncap * sizeof(*hf->cu_snap));
+            if (p) {
+                hf->cu_snap     = p;
+                hf->cu_snap_cap = ncap;
+            }
+        }
+        if (hf->cu_snap && hf->nb_cu_snap < hf->cu_snap_cap) {
+            struct HEVCCUInfo *ci = &hf->cu_snap[hf->nb_cu_snap++];
+            ci->x     = x0;
+            ci->y     = y0;
+            ci->w     = cb_size;
+            ci->h     = cb_size;
+            ci->depth = sps->log2_ctb_size - log2_cb_size;
+        }
+    }
+
     lc->cu.x                = x0;
     lc->cu.y                = y0;
     lc->cu.pred_mode        = MODE_INTRA;
@@ -3556,6 +3581,22 @@ static int hevc_frame_end(HEVCContext *s, HEVCLayerContext *l)
         }
     }
     s->sei.picture_hash.is_md5 = 0;
+
+    /* PlayerX: in CU-export mode the current frame's output was deferred in
+     * ff_hevc_output_frames() because its snapshot was not ready at
+     * frame_start time. Now the picture is fully decoded and the snapshot is
+     * complete, so flush pending outputs to emit it with side data attached. */
+    if (s->avctx &&
+        (s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS) &&
+        l->sps) {
+        int r = ff_hevc_output_frames(s, s->layers_active_decode,
+                                      s->layers_active_output,
+                                      l->sps->temporal_layer[l->sps->max_sub_layers - 1].num_reorder_pics,
+                                      l->sps->temporal_layer[l->sps->max_sub_layers - 1].max_dec_pic_buffering,
+                                      0);
+        if (r < 0)
+            return r;
+    }
 
     av_log(s->avctx, AV_LOG_DEBUG, "Decoded frame with POC %zu/%d.\n",
            l - s->layers, s->poc);
