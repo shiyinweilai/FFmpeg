@@ -386,6 +386,7 @@ typedef struct HEVCFrame {
         int16_t x, y;
         int16_t w, h;
         int8_t  depth;
+        int8_t  qp;               ///< PlayerX: final luma QP (-1 = errored CU)
     } *cu_snap;
     int  nb_cu_snap;
     int  cu_snap_cap;

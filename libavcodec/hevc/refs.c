@@ -63,14 +63,17 @@ void ff_hevc_unref_frame(HEVCFrame *frame, int flags)
 /* PlayerX: export HEVC leaf-CU partition as AV_VIDEO_ENC_PARAMS side data,
  * mirroring the VVC path. Only invoked when the bitstream-analysis decoder
  * enabled AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS, and only when a snapshot
- * was actually captured. delta_qp is left 0 (partition-only view).
- * Called from hevc_frame_end() after the picture is fully decoded so the
- * snapshot is complete. */
+ * was actually captured. Each CU's final luma QP (captured after QP
+ * prediction/delta coding completed) is exported via par->qp baseline +
+ * per-block delta_qp. Called from hevc_frame_end() after the picture is
+ * fully decoded so the snapshot is complete. */
 void ff_hevc_export_cu_partition(HEVCContext *s, const HEVCFrame *frame,
                                  AVFrame *out)
 {
     unsigned int nb_blocks;
     AVVideoEncParams *par;
+    int frame_qp = 0;
+    int have_qp  = 0;
 
     if (!s->avctx ||
         !(s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS))
@@ -84,7 +87,17 @@ void ff_hevc_export_cu_partition(HEVCContext *s, const HEVCFrame *frame,
     if (!par)
         return;
 
-    par->qp = 0;
+    /* Frame baseline QP: first CU carrying a valid QP (mirrors VVC patch:
+     * par->qp = first block's QP, each block's delta_qp = qp - baseline). */
+    for (unsigned int i = 0; i < nb_blocks; i++) {
+        if (frame->cu_snap[i].qp >= 0) {
+            frame_qp = frame->cu_snap[i].qp;
+            have_qp  = 1;
+            break;
+        }
+    }
+    par->qp = frame_qp;
+
     for (unsigned int i = 0; i < nb_blocks; i++) {
         const struct HEVCCUInfo *ci = &frame->cu_snap[i];
         AVVideoBlockParams *b = av_video_enc_params_block(par, i);
@@ -92,7 +105,7 @@ void ff_hevc_export_cu_partition(HEVCContext *s, const HEVCFrame *frame,
         b->src_y    = ci->y;
         b->w        = ci->w;
         b->h        = ci->h;
-        b->delta_qp = 0;
+        b->delta_qp = have_qp && ci->qp >= 0 ? (ci->qp - frame_qp) : 0;
     }
 }
 

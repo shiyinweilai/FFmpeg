@@ -2453,6 +2453,7 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
     int idx              = log2_cb_size - 2;
     int qp_block_mask    = (1 << (sps->log2_ctb_size - pps->diff_cu_qp_delta_depth)) - 1;
     int x, y, ret;
+    int snap_idx = -1;   /* PlayerX: this CU's slot in cur_frame->cu_snap */
 
     /* PlayerX: record this leaf CU (square cb_size x cb_size) for bitstream
      * analysis export. Gated by AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS so that
@@ -2476,6 +2477,8 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
             ci->w     = cb_size;
             ci->h     = cb_size;
             ci->depth = sps->log2_ctb_size - log2_cb_size;
+            ci->qp    = -1;
+            snap_idx  = hf->nb_cu_snap - 1;
         }
     }
 
@@ -2640,6 +2643,12 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
         memset(&l->qp_y_tab[x], lc->qp_y, length);
         x += min_cb_width;
     }
+
+    /* PlayerX: backfill the final luma QP into this CU's snapshot entry.
+     * lc->qp_y here is the QP actually written into qp_y_tab above. */
+    if (snap_idx >= 0 && s->cur_frame &&
+        s->cur_frame->cu_snap && snap_idx < s->cur_frame->nb_cu_snap)
+        s->cur_frame->cu_snap[snap_idx].qp = lc->qp_y;
 
     if(((x0 + (1<<log2_cb_size)) & qp_block_mask) == 0 &&
        ((y0 + (1<<log2_cb_size)) & qp_block_mask) == 0) {
