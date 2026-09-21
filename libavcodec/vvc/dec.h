@@ -105,10 +105,18 @@ typedef struct VVCFrame {
         int16_t w, h;
         int8_t  depth;
         int8_t  tree_type;
+        /* PlayerX: block-level coding info captured at add_cu() time, when
+         * cu->qp[] / pred_mode / mi are still valid. Exporting these from the
+         * snapshot avoids reading fc->tab.qp after it has been recycled. */
+        int8_t  qp;          ///< Qp'Y of this CU (cu->qp[0])
+        int8_t  pred_mode;   ///< MODE_INTRA / MODE_INTER / MODE_IBC / MODE_PLT / MODE_SKIP
+        int8_t  ref_idx[2];  ///< refIdxL0 / refIdxL1 (-1 when unused)
+        uint8_t pred_flag;   ///< bit0 = L0 used, bit1 = L1 used (PredFlag)
+        uint8_t skip_flag;   ///< cu_skip_flag
+        int16_t mv[2][2];    ///< [LX][x|y] motion vector in 1/16-pel units
     } *cu_snap;
     int  nb_cu_snap;
     int  cu_snap_cap;
-
     /**
      * A sequence counter, so that old frames are output first
      * after a POC reset

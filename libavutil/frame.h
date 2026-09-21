@@ -305,6 +305,19 @@ enum AVFrameSideDataType {
      * The data is the AVDownmixMatrix struct defined in libavutil/downmix_info.h.
      */
     AV_FRAME_DATA_DOWNMIX_MATRIX,
+
+    /**
+     * PlayerX 定制：逐 CU（编码单元）真实编码信息，与
+     * AV_FRAME_DATA_VIDEO_ENC_PARAMS 的块一一对应、同序。
+     *
+     * ENC_PARAMS 的 AVVideoBlockParams 只有 src_x/y/w/h/delta_qp，
+     * 装不下预测模式 / MV / 参考索引，故另开一条 side data 承载。
+     * 数据为紧凑定长数组：AVCodecBlockInfo[nb_blocks]，
+     * 元素个数 = side data size / sizeof(AVCodecBlockInfo)。
+     * 目前由 VVC 解码器导出（需 export_side_data 含
+     * AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS）。
+     */
+    AV_FRAME_DATA_CODEC_BLOCK_INFO,
 };
 
 enum AVActiveFormatDescription {

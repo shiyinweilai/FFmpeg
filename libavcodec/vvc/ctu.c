@@ -1254,6 +1254,7 @@ static CodingUnit* add_cu(VVCLocalContext *lc, const int x0, const int y0,
     cu->coded_flag = 1;
     cu->num_intra_subpartitions = 1;
     cu->pu.dmvr_flag = 0;
+    cu->snap_idx = -1;   /* PlayerX: -1 = not recorded in cu_snap[] */
 
     set_cb_pos(fc, cu);
 
@@ -1277,17 +1278,90 @@ static CodingUnit* add_cu(VVCLocalContext *lc, const int x0, const int y0,
             }
         }
         if (vf->cu_snap && vf->nb_cu_snap < vf->cu_snap_cap) {
-            struct VVCCUInfo *ci = &vf->cu_snap[vf->nb_cu_snap++];
+            const int idx = vf->nb_cu_snap++;   /* atomic-safe: only this thread writes fc->ref */
+            struct VVCCUInfo *ci = &vf->cu_snap[idx];
+            cu->snap_idx = idx;   /* store in CodingUnit (thread-local) for snap_fill */
+            /* geometry only; QP / pred_mode / MV filled later in ff_vvc_cu_snap_fill() */
             ci->x         = cu->x0;
             ci->y         = cu->y0;
             ci->w         = cu->cb_width;
             ci->h         = cu->cb_height;
             ci->depth     = cqt_depth;
             ci->tree_type = tree_type;
+            ci->qp        = 0;
+            ci->pred_mode = MODE_INTRA;
+            ci->skip_flag = 0;
+            ci->pred_flag = 0;
+            ci->ref_idx[0] = -1;
+            ci->ref_idx[1] = -1;
+            ci->mv[0][0] = ci->mv[0][1] = 0;
+            ci->mv[1][0] = ci->mv[1][1] = 0;
+        } else {
+            cu->snap_idx = -1;
         }
-        }
+        }   /* if (want_snap) */
     }
     return cu;
+}
+
+/* PlayerX: 在 CU 完整解析后回填编码信息。
+ * add_cu() 位于 hls_coding_unit() 开头，那时 pred_mode / qp 尚未赋值，
+ * 因此这里按 (x,y,w,h,tree) 反向查找该 CU 的快照记录并补齐。 */
+void ff_vvc_cu_snap_fill(const VVCLocalContext *lc, const CodingUnit *cu,
+                         const int cqt_depth)
+{
+    const VVCFrameContext *fc = lc->fc;
+    VVCFrame *vf;
+    struct VVCCUInfo *ci;
+    const PredictionUnit *pu = &cu->pu;
+
+    if (!fc || !fc->ref || cu->tree_type == DUAL_TREE_CHROMA)
+        return;
+
+    {
+        const AVCodecContext *avctx = (const AVCodecContext *)fc->log_ctx;
+        if (!avctx || !(avctx->export_side_data &
+                        AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS))
+            return;
+    }
+
+    /* cu->snap_idx is set in add_cu() on the same thread — no race */
+    if (cu->snap_idx < 0)
+        return;
+
+    vf = fc->ref;
+    if (!vf->cu_snap || cu->snap_idx >= vf->nb_cu_snap)
+        return;
+
+    ci = &vf->cu_snap[cu->snap_idx];
+
+    ci->depth     = cqt_depth;
+    ci->qp        = cu->qp[0];
+    ci->pred_mode = (int8_t)cu->pred_mode;
+    ci->skip_flag = cu->skip_flag ? 1 : 0;
+
+    /* Read MV directly from pu->mi (already set by inter_data/merge paths
+     * before snap_fill is called, and before set_cu_tabs writes tab.mvf). */
+    if (cu->pred_mode == MODE_INTER || cu->pred_mode == MODE_IBC) {
+        const MvField *mi = &pu->mi;
+        ci->pred_flag     = mi->pred_flag;
+        if (mi->pred_flag & PF_L0) {
+            ci->mv[0][0]   = mi->mv[L0].x;
+            ci->mv[0][1]   = mi->mv[L0].y;
+            ci->ref_idx[0] = mi->ref_idx[L0];
+        }
+        if (mi->pred_flag & PF_L1) {
+            ci->mv[1][0]   = mi->mv[L1].x;
+            ci->mv[1][1]   = mi->mv[L1].y;
+            ci->ref_idx[1] = mi->ref_idx[L1];
+        }
+    } else {
+        ci->pred_flag  = 0;
+        ci->ref_idx[0] = -1;
+        ci->ref_idx[1] = -1;
+        ci->mv[0][0] = ci->mv[0][1] = 0;
+        ci->mv[1][0] = ci->mv[1][1] = 0;
+    }
 }
 
 static void set_cu_tabs(const VVCLocalContext *lc, const CodingUnit *cu)
@@ -2265,6 +2339,11 @@ static int hls_coding_unit(VVCLocalContext *lc, int x0, int y0, int cb_width, in
         if (ret < 0)
             return ret;
     }
+
+    /* PlayerX: 此刻 CU 已完整解析（pred_mode、qp、skip_flag 均已就绪），
+     * 把编码信息回填到 add_cu() 时预留的那条快照记录。 */
+    ff_vvc_cu_snap_fill(lc, cu, cqt_depth);
+
     set_cu_tabs(lc, cu);
 
     return 0;

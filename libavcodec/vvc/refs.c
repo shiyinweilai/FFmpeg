@@ -22,11 +22,12 @@
 
 #include <stdatomic.h>
 #include <stdbool.h>
-
+#include <string.h>
 #include "libavutil/mem.h"
 #include "libavutil/thread.h"
 #include "libavutil/refstruct.h"
 #include "libavutil/video_enc_params.h"   /* PlayerX 定制：VVC 块级导出 */
+#include "libavutil/codec_block_info.h"   /* PlayerX 定制：逐 CU 编码信息 */
 #include "libavcodec/vvc/ctu.h"           /* PlayerX 定制：CodingUnit 定义 */
 #include "libavcodec/thread.h"
 #include "libavcodec/decode.h"
@@ -72,8 +73,8 @@ void ff_vvc_unref_frame(VVCFrameContext *fc, VVCFrame *frame, int flags)
 
         /* PlayerX: release partition snapshot */
         av_freep(&frame->cu_snap);
-        frame->nb_cu_snap  = 0;
-        frame->cu_snap_cap = 0;
+        frame->nb_cu_snap   = 0;
+        frame->cu_snap_cap  = 0;
 
         frame->collocated_ref = NULL;
         av_refstruct_unref(&frame->hwaccel_picture_private);
@@ -258,7 +259,6 @@ int ff_vvc_set_new_ref(VVCContext *s, VVCFrameContext *fc, AVFrame **frame)
     /* PlayerX: start a fresh partition snapshot for this picture
      * (reuse previously allocated buffer if any) */
     ref->nb_cu_snap = 0;
-
     if (s->no_output_before_recovery_flag && (IS_RASL(s) || !GDR_IS_RECOVERED(s)))
         ref->flags = VVC_FRAME_FLAG_SHORT_REF;
     else if (ph->r->ph_pic_output_flag)
@@ -308,8 +308,11 @@ void ff_vvc_export_enc_params(VVCContext *s, const VVCFrameContext *fc,
     const int min_cb_log2  = sps ? sps->min_cb_log2_size_y : 2;
     const int min_cb_width = pps ? pps->min_cb_width : 0;
     int frame_qp           = 0;
+    AVFrame  *dst = out ? out : (vf ? vf->frame : NULL);
 
     if (!sps || !pps || !fc->tab.cus || !fc->tab.qp[LUMA] || ctu_count <= 0)
+        return;
+    if (!dst)
         return;
 
     /* PlayerX: the picture being output may be a VVCFrame owned by a different
@@ -317,21 +320,37 @@ void ff_vvc_export_enc_params(VVCContext *s, const VVCFrameContext *fc,
      * parallel, each with its own DPB). The snapshot was written on the
      * decoding fc's frame, so locate the frame carrying the snapshot by POC
      * across all frame contexts. */
-    if ((!vf || vf->nb_cu_snap == 0) && s && s->fcs) {
-        const int want_poc = vf ? vf->poc : INT_MIN;
-        for (int f = 0; f < s->nb_fcs && want_poc != INT_MIN; f++) {
+    /* 注意：不可跨 frame context 借用其它 DPB 槽位的 cu_snap。
+     * 那些帧可能被并行解码线程随时 av_freep() 释放/搬迁，
+     * 借用会导致 use-after-free（SIGSEGV）。快照只在当前 fc 自己的
+     * 输出帧上读取；若不可用则回退到下方 cb_width/cb_height 网格重建。 */
+    /* 快照由解码时 fc->ref 写入，而输出的槽位是 fc->DPB[min_idx]；
+     * 多线程下两者可能不是同一个槽位，故在当前 fc 的 DPB 内按 POC
+     * 找回承载快照的槽位。只在同一个 fc 内查找：不同 fc 的帧会被
+     * 并行解码线程随时 av_freep() 释放，跨 fc 借用会 use-after-free。 */
+    const VVCFrameContext *src_fc = fc;   /* fc that wrote the snapshot */
+    /* The snapshot is written on fc->ref at decode time, but the frame
+     * being output is fc->DPB[min_idx] — they are different VVCFrame slots.
+     * Search all frame contexts for the VVCFrame carrying the snapshot for
+     * this POC.  This is safe because AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS
+     * is only set on the bitstream-analysis path which uses thread_count=1
+     * on the AVCodecContext level; no parallel decode threads are racing
+     * against this lookup. */
+    if (vf && vf->nb_cu_snap == 0 && s && s->fcs) {
+        const int want_poc = vf->poc;
+        for (int f = 0; f < s->nb_fcs; f++) {
             const VVCFrameContext *cand = &s->fcs[f];
             for (int i = 0; i < FF_ARRAY_ELEMS(cand->DPB); i++) {
                 const VVCFrame *df = &cand->DPB[i];
                 if (df->poc == want_poc && df->nb_cu_snap > 0 && df->cu_snap) {
-                    vf = df;
-                    break;
+                    vf     = df;
+                    src_fc = cand;
+                    goto snap_found;
                 }
             }
-            if (vf && vf->nb_cu_snap > 0)
-                break;
         }
     }
+snap_found:;
 
     /* CU 重建：优先使用 add_cu 阶段记录的叶子快照（出帧后仍有效，
      * 覆盖 I 帧 dual tree 隐式 QT 之后的完整细分，与 vvdec/VQ 一致）。
@@ -342,27 +361,71 @@ void ff_vvc_export_enc_params(VVCContext *s, const VVCFrameContext *fc,
             return;
 
         par = av_video_enc_params_create_side_data(
-                  out, AV_VIDEO_ENC_PARAMS_H264, nb_blocks);
+                  dst, AV_VIDEO_ENC_PARAMS_H264, nb_blocks);
         if (!par)
             return;
 
-        frame_qp = fc->tab.qp[LUMA][0];
+        frame_qp = 0;
         par->qp  = frame_qp;
+
+        /* PlayerX: 与 enc_params 块一一对应的完整编码信息 */
+        /* PlayerX: 与 enc_params 块一一对应的完整编码信息。
+         * 注意 av_frame_new_side_data() 返回的是 AVFrameSideData*，
+         * 真正的缓冲区在 ->data，不可直接当数据指针使用。 */
+        AVFrameSideData *cbsd = av_frame_new_side_data(
+            dst, AV_FRAME_DATA_CODEC_BLOCK_INFO,
+            nb_blocks * (int)sizeof(AVCodecBlockInfo));
+        AVCodecBlockInfo *cb = cbsd
+            ? (AVCodecBlockInfo *)cbsd->data : NULL;
+        if (cb)
+            memset(cb, 0, nb_blocks * sizeof(AVCodecBlockInfo));
 
         for (int i = 0; i < nb_blocks; i++) {
             const struct VVCCUInfo *ci = &vf->cu_snap[i];
             AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx++);
-            /* QP 按 min_cb(4x4) 网格取该 CU 左上角所属格 */
-            const int qx = pps ? (ci->x >> min_cb_log2) : 0;
-            const int qy = pps ? (ci->y >> min_cb_log2) : 0;
-            const int q  = (pps && fc->tab.qp[LUMA] &&
-                            qx < min_cb_width) ?
-                           fc->tab.qp[LUMA][qx + qy * min_cb_width] : frame_qp;
             b->src_x    = ci->x;
             b->src_y    = ci->y;
             b->w        = ci->w;
             b->h        = ci->h;
-            b->delta_qp = q - frame_qp;
+            b->delta_qp = ci->qp;
+
+            if (cb) {
+                AVCodecBlockInfo *o = &cb[i];
+                o->x          = ci->x;
+                o->y          = ci->y;
+                o->w          = ci->w;
+                o->h          = ci->h;
+                o->qp         = ci->qp;
+                o->pred_mode  = ci->pred_mode;
+                o->pred_flag  = ci->pred_flag;
+                o->skip_flag  = ci->skip_flag;
+                o->ref_idx[0] = ci->ref_idx[0];
+                o->ref_idx[1] = ci->ref_idx[1];
+                o->mv[0][0]   = ci->mv[0][0];
+                o->mv[0][1]   = ci->mv[0][1];
+                o->mv[1][0]   = ci->mv[1][0];
+                o->mv[1][1]   = ci->mv[1][1];
+                o->reserved   = 0;
+
+                /* MV：pu.mi 在 add_cu 时还未填充，此处按 CU 左上角
+                 * 从 tab_mvf（4x4 PU 网格）取解码完成后的真实运动信息。 */
+                if (ci->pred_mode != MODE_INTRA && src_fc->tab.mvf && pps) {
+                    const int xp = ci->x >> MIN_PU_LOG2;
+                    const int yp = ci->y >> MIN_PU_LOG2;
+                    if (xp >= 0 && xp < pps->min_pu_width &&
+                        yp >= 0 && yp < pps->min_pu_height) {
+                        const MvField *mvf =
+                            &src_fc->tab.mvf[yp * pps->min_pu_width + xp];
+                        o->pred_flag  = (uint8_t)mvf->pred_flag;
+                        o->ref_idx[0] = mvf->ref_idx[0];
+                        o->ref_idx[1] = mvf->ref_idx[1];
+                        o->mv[0][0]   = (int16_t)mvf->mv[0].x;
+                        o->mv[0][1]   = (int16_t)mvf->mv[0].y;
+                        o->mv[1][0]   = (int16_t)mvf->mv[1].x;
+                        o->mv[1][1]   = (int16_t)mvf->mv[1].y;
+                    }
+                }
+            }
         }
         return;
     } else {
@@ -383,7 +446,7 @@ void ff_vvc_export_enc_params(VVCContext *s, const VVCFrameContext *fc,
             return;
 
         par = av_video_enc_params_create_side_data(
-                  out, AV_VIDEO_ENC_PARAMS_H264, nb_blocks);
+                  dst, AV_VIDEO_ENC_PARAMS_H264, nb_blocks);
         if (!par)
             return;
 
@@ -450,16 +513,16 @@ int ff_vvc_output_frame(VVCContext *s, VVCFrameContext *fc, AVFrame *out, const 
             if (frame->flags & VVC_FRAME_FLAG_CORRUPT)
                 frame->frame->flags |= AV_FRAME_FLAG_CORRUPT;
 
+            /* PlayerX: 在 av_frame_ref() 之前导出块编码信息，这样 side data
+             * 会被一并带进输出帧。只使用当前 fc 自己的 DPB 帧：同一 fc 内
+             * 解码已完成并同步，安全；跨 fc 借用会被并行线程 av_freep()
+             * 释放，导致 use-after-free。 */
+            ff_vvc_export_enc_params(s, fc, frame, out);
+
             ret = av_frame_ref(out, frame->needs_fg ? frame->frame_grain : frame->frame);
 
             if (!ret && !(s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN))
                 av_frame_remove_side_data(out, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
-
-            /* PlayerX: export real VVC CU partition to the frame actually
-             * being output, right after the picture is selected and ref'd. */
-            if (!ret &&
-                (s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS))
-                ff_vvc_export_enc_params(s, fc, frame, out);
 
             if (frame->flags & VVC_FRAME_FLAG_BUMPING)
                 ff_vvc_unref_frame(fc, frame, VVC_FRAME_FLAG_OUTPUT | VVC_FRAME_FLAG_BUMPING);
@@ -578,6 +641,7 @@ static VVCFrame *generate_missing_ref(VVCContext *s, VVCFrameContext *fc, int po
     frame->sequence = s->seq_decode;
     frame->flags    = VVC_FRAME_FLAG_CORRUPT;
 
+    /* 缺失参考帧：无快照，传 NULL 跳过块信息导出 */
     ff_vvc_report_frame_finished(frame);
 
     return frame;

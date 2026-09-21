@@ -340,6 +340,11 @@ typedef struct CodingUnit {
     PredictionUnit pu;
 
     struct CodingUnit *next;                        ///< RefStruct reference
+
+    /* PlayerX: index into VVCFrame.cu_snap[] for this CU; -1 = not recorded.
+     * Stored in the CodingUnit (thread-local) rather than a shared frame field
+     * to avoid data races in multi-threaded decode. */
+    int snap_idx;
 } CodingUnit;
 
 typedef struct CTU {
@@ -517,5 +522,8 @@ void ff_vvc_ctu_free_cus(CodingUnit **cus);
 int ff_vvc_get_qPy(const VVCFrameContext *fc, int xc, int yc);
 void ff_vvc_ep_init_stat_coeff(EntryPoint *ep, int bit_depth, int persistent_rice_adaptation_enabled_flag);
 void ff_vvc_channel_range(int *start, int *end, VVCTreeType tree_type, uint8_t chroma_format_idc);
+
+// PlayerX: 回填 CU 快照的编码信息（QP / 预测模式 / skip）
+void ff_vvc_cu_snap_fill(const VVCLocalContext *lc, const CodingUnit *cu, const int cqt_depth);
 
 #endif // AVCODEC_VVC_CTU_H

@@ -97,6 +97,7 @@ HEADERS = adler32.h                                                     \
           uuid.h                                                        \
           version.h                                                     \
           video_enc_params.h                                            \
+          codec_block_info.h                                            \
           xtea.h                                                        \
           tea.h                                                         \
           tx.h                                                          \
