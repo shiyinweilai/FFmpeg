@@ -1117,6 +1117,16 @@ static int frame_end(VVCContext *s, VVCFrameContext *fc)
         }
     }
 
+    /* PlayerX: 在解码收尾（CU 数据 fc->tab.cus 释放前、fc->ref 仍有效）
+     * 把该帧的 CU 快照导出到 fc->ref->frame 的 side_data。fc->ref->frame
+     * 是这一帧从解码到输出唯一贯穿始终的载体（AVFrame，随引用计数），
+     * 而 cu_snap 此刻已在 fc->ref 上定稿。相比旧方案在输出时刻从
+     * fc->DPB[min_idx]（一个已被复用清空 cu_snap 的 VVCFrame 包装）读取、
+     * 再跨 fc 按 POC 碰运气查找，这里一步到位、100% 命中、不受多 fc/
+     * DPB 复用影响，彻底解决个别帧（非参考 B 帧）无 CU 网格的问题。 */
+    if (fc->ref && fc->ref->frame)
+        ff_vvc_export_enc_params(s, fc, fc->ref, fc->ref->frame);
+
     return 0;
 }
 
@@ -1280,7 +1290,18 @@ static av_cold int vvc_decode_init(AVCodecContext *avctx)
             return ret;
     }
 
-    s->nb_fcs = (avctx->flags & AV_CODEC_FLAG_LOW_DELAY) ? 1 : delayed;
+    /* PlayerX: 导出 CU 划分（venc_params）时强制单 frame context。
+     * VVC 默认 nb_fcs>1 开启帧级并行流水线，使多帧同时在解码管线中；
+     * 按显示序 bump 输出时，被输出的小 POC B 帧其 frame_end（CU 快照定稿
+     * 并挂 side_data）尚未执行——输出早于解码，side_data 永远赶不上，
+     * 表现为个别非参考 B 帧无 CU 网格。单 fc 时解码与输出严格串行
+     * （frame_end 必在下一帧 frame_start 的 bump 输出之前完成），与
+     * HEVC 单 cur_frame 模型一致，配合 frame_end 导出 + 输出点窄条件
+     * defer 即可保证每帧 side_data 就位。分析场景本就单线程顺序解码，
+     * 关闭流水线不影响吞吐。 */
+    s->nb_fcs = ((avctx->flags & AV_CODEC_FLAG_LOW_DELAY) ||
+                 (avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS))
+                ? 1 : delayed;
     s->fcs = av_calloc(s->nb_fcs, sizeof(*s->fcs));
     if (!s->fcs)
         return AVERROR(ENOMEM);

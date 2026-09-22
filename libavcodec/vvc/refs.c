@@ -256,9 +256,12 @@ int ff_vvc_set_new_ref(VVCContext *s, VVCFrameContext *fc, AVFrame **frame)
     *frame = ref->frame;
     fc->ref = ref;
 
-    /* PlayerX: start a fresh partition snapshot for this picture
-     * (reuse previously allocated buffer if any) */
-    ref->nb_cu_snap = 0;
+    /* PlayerX: 不在此处清零 nb_cu_snap。
+     * 该槽位只有走过 ff_vvc_unref_frame（buf[0] 已 NULL）才会被 alloc_frame
+     * 复用，而 unref 时已由 av_freep(&cu_snap) 把 nb_cu_snap 归零。若在此处
+     * 额外清零，会在“数据缓冲仍在、帧尚未真正释放”的窗口把计数抹成 0，
+     * 导致该 POC 被输出时导出端按 nb_cu_snap>0 查不到快照（表现为个别帧无
+     * CU 网格）。计数的生命周期须与 cu_snap 缓冲严格一致，仅在 av_freep 时归零。 */
     if (s->no_output_before_recovery_flag && (IS_RASL(s) || !GDR_IS_RECOVERED(s)))
         ref->flags = VVC_FRAME_FLAG_SHORT_REF;
     else if (ph->r->ph_pic_output_flag)
@@ -315,46 +318,10 @@ void ff_vvc_export_enc_params(VVCContext *s, const VVCFrameContext *fc,
     if (!dst)
         return;
 
-    /* PlayerX: the picture being output may be a VVCFrame owned by a different
-     * frame context than the one that decoded it (multiple s->fcs run in
-     * parallel, each with its own DPB). The snapshot was written on the
-     * decoding fc's frame, so locate the frame carrying the snapshot by POC
-     * across all frame contexts. */
-    /* 注意：不可跨 frame context 借用其它 DPB 槽位的 cu_snap。
-     * 那些帧可能被并行解码线程随时 av_freep() 释放/搬迁，
-     * 借用会导致 use-after-free（SIGSEGV）。快照只在当前 fc 自己的
-     * 输出帧上读取；若不可用则回退到下方 cb_width/cb_height 网格重建。 */
-    /* 快照由解码时 fc->ref 写入，而输出的槽位是 fc->DPB[min_idx]；
-     * 多线程下两者可能不是同一个槽位，故在当前 fc 的 DPB 内按 POC
-     * 找回承载快照的槽位。只在同一个 fc 内查找：不同 fc 的帧会被
-     * 并行解码线程随时 av_freep() 释放，跨 fc 借用会 use-after-free。 */
-    const VVCFrameContext *src_fc = fc;   /* fc that wrote the snapshot */
-    /* The snapshot is written on fc->ref at decode time, but the frame
-     * being output is fc->DPB[min_idx] — they are different VVCFrame slots.
-     * Search all frame contexts for the VVCFrame carrying the snapshot for
-     * this POC.  This is safe because AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS
-     * is only set on the bitstream-analysis path which uses thread_count=1
-     * on the AVCodecContext level; no parallel decode threads are racing
-     * against this lookup. */
-    if (vf && vf->nb_cu_snap == 0 && s && s->fcs) {
-        const int want_poc = vf->poc;
-        for (int f = 0; f < s->nb_fcs; f++) {
-            const VVCFrameContext *cand = &s->fcs[f];
-            for (int i = 0; i < FF_ARRAY_ELEMS(cand->DPB); i++) {
-                const VVCFrame *df = &cand->DPB[i];
-                if (df->poc == want_poc && df->nb_cu_snap > 0 && df->cu_snap) {
-                    vf     = df;
-                    src_fc = cand;
-                    goto snap_found;
-                }
-            }
-        }
-    }
-snap_found:;
-
-    /* CU 重建：优先使用 add_cu 阶段记录的叶子快照（出帧后仍有效，
-     * 覆盖 I 帧 dual tree 隐式 QT 之后的完整细分，与 vvdec/VQ 一致）。
-     * 若快照不可用（异常路径），回退到 cb_width/cb_height 网格反推。 */
+    /* PlayerX: 本函数现由 frame_end() 调用，vf == fc->ref、out == fc->ref->frame，
+     * cu_snap 此刻已在 vf 上定稿。快照与承载帧一一对应，无需跨 frame context
+     * 查找（旧的按 POC 跨 fc 借用方案已废弃，那既有 use-after-free 风险，命中率
+     * 又不满，导致非参考帧丢网格）。 */
     if (vf && vf->nb_cu_snap > 0 && vf->cu_snap) {
         nb_blocks = vf->nb_cu_snap;
         if (!nb_blocks)
@@ -406,25 +373,9 @@ snap_found:;
                 o->mv[1][0]   = ci->mv[1][0];
                 o->mv[1][1]   = ci->mv[1][1];
                 o->reserved   = 0;
-
-                /* MV：pu.mi 在 add_cu 时还未填充，此处按 CU 左上角
-                 * 从 tab_mvf（4x4 PU 网格）取解码完成后的真实运动信息。 */
-                if (ci->pred_mode != MODE_INTRA && src_fc->tab.mvf && pps) {
-                    const int xp = ci->x >> MIN_PU_LOG2;
-                    const int yp = ci->y >> MIN_PU_LOG2;
-                    if (xp >= 0 && xp < pps->min_pu_width &&
-                        yp >= 0 && yp < pps->min_pu_height) {
-                        const MvField *mvf =
-                            &src_fc->tab.mvf[yp * pps->min_pu_width + xp];
-                        o->pred_flag  = (uint8_t)mvf->pred_flag;
-                        o->ref_idx[0] = mvf->ref_idx[0];
-                        o->ref_idx[1] = mvf->ref_idx[1];
-                        o->mv[0][0]   = (int16_t)mvf->mv[0].x;
-                        o->mv[0][1]   = (int16_t)mvf->mv[0].y;
-                        o->mv[1][0]   = (int16_t)mvf->mv[1].x;
-                        o->mv[1][1]   = (int16_t)mvf->mv[1].y;
-                    }
-                }
+                /* MV 已在 ff_vvc_cu_snap_fill() 里从 pu->mi 正确回填，
+                 * 此处不再从 fc->tab.mvf 重读——frame_end 阶段 tab.mvf
+                 * 可能已属于下一帧，重读会污染运动信息。 */
             }
         }
         return;
@@ -475,6 +426,14 @@ snap_found:;
 int ff_vvc_output_frame(VVCContext *s, VVCFrameContext *fc, AVFrame *out, const int no_output_of_prior_pics_flag, int flush)
 {
     const VVCSPS *sps = fc->ps.sps;
+    /* PlayerX: 导出 CU 划分时，当前 fc 正在解码的帧（fc->ref）此刻 CU 快照
+     * 尚未捕获（frame_end 才定稿并挂 side_data）。若按显示序提前 bump 输出，
+     * side_data 永远赶不上。故导出模式下只推迟这一帧的输出，直到 frame_end。
+     * 对照 HEVC ff_hevc_output_frames 只跳 cur_frame 的 defer_export 机制。
+     * flush 阶段无条件输出，避免残留帧卡住。 */
+    const int defer_export =
+        s->avctx && !flush &&
+        (s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS);
     do {
         int nb_output = 0;
         int min_poc   = INT_MAX;
@@ -492,6 +451,9 @@ int ff_vvc_output_frame(VVCContext *s, VVCFrameContext *fc, AVFrame *out, const 
 
         for (int i = 0; i < FF_ARRAY_ELEMS(fc->DPB); i++) {
             VVCFrame *frame = &fc->DPB[i];
+            /* 只推迟当前 fc 正在解码、快照未捕获的那一帧 */
+            if (defer_export && frame == fc->ref && frame->nb_cu_snap == 0)
+                continue;
             if ((frame->flags & VVC_FRAME_FLAG_OUTPUT) &&
                 frame->sequence == s->seq_output) {
                 nb_output++;
@@ -513,12 +475,10 @@ int ff_vvc_output_frame(VVCContext *s, VVCFrameContext *fc, AVFrame *out, const 
             if (frame->flags & VVC_FRAME_FLAG_CORRUPT)
                 frame->frame->flags |= AV_FRAME_FLAG_CORRUPT;
 
-            /* PlayerX: 在 av_frame_ref() 之前导出块编码信息，这样 side data
-             * 会被一并带进输出帧。只使用当前 fc 自己的 DPB 帧：同一 fc 内
-             * 解码已完成并同步，安全；跨 fc 借用会被并行线程 av_freep()
-             * 释放，导致 use-after-free。 */
-            ff_vvc_export_enc_params(s, fc, frame, out);
-
+            /* PlayerX: 块编码信息已在 frame_end() 阶段导出到 frame->frame 的
+             * side_data（那时 cu_snap 定稿、载体 AVFrame 稳定）。此处无需再次
+             * 导出——下面的 av_frame_ref() 会把已挂好的 side_data 一并带进
+             * 输出帧。旧的“输出时导出 + 跨 fc 按 POC 查找”方案已废弃。 */
             ret = av_frame_ref(out, frame->needs_fg ? frame->frame_grain : frame->frame);
 
             if (!ret && !(s->avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN))
