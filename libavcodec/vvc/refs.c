@@ -366,13 +366,14 @@ void ff_vvc_export_enc_params(VVCContext *s, const VVCFrameContext *fc,
                 o->pred_mode  = ci->pred_mode;
                 o->pred_flag  = ci->pred_flag;
                 o->skip_flag  = ci->skip_flag;
+                o->qt_depth   = ci->depth;
+                o->tree_type  = ci->tree_type;
                 o->ref_idx[0] = ci->ref_idx[0];
                 o->ref_idx[1] = ci->ref_idx[1];
                 o->mv[0][0]   = ci->mv[0][0];
                 o->mv[0][1]   = ci->mv[0][1];
                 o->mv[1][0]   = ci->mv[1][0];
                 o->mv[1][1]   = ci->mv[1][1];
-                o->reserved   = 0;
                 /* MV 已在 ff_vvc_cu_snap_fill() 里从 pu->mi 正确回填，
                  * 此处不再从 fc->tab.mvf 重读——frame_end 阶段 tab.mvf
                  * 可能已属于下一帧，重读会污染运动信息。 */

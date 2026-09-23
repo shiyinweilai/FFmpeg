@@ -54,7 +54,8 @@ typedef struct AVCodecBlockInfo {
     int8_t  ref_idx[2];     ///< refIdxL0 / refIdxL1，未使用时为 -1
     uint8_t pred_flag;      ///< AVCodecBlockPredFlag
     uint8_t skip_flag;      ///< cu_skip_flag：1 表示 skip（无残差）
-    uint8_t reserved;       ///< 对齐保留，置 0
+    int8_t  qt_depth;       ///< cqt_depth（四叉树深度）
+    int8_t  tree_type;      ///< 0=SINGLE_TREE 1=DUAL_TREE_LUMA 2=DUAL_TREE_CHROMA
 
     int16_t mv[2][2];       ///< mv[LX][0=x,1=y]，LX: 0=L0, 1=L1；单位 1/16 像素
 } AVCodecBlockInfo;
