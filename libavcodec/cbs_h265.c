@@ -128,8 +128,29 @@ static int FUNC_H265(name) args
     } while (0)
 
 
+/* 推断值也走 CBS trace：H.265 大量字段（VUI 默认、conf_win、
+ * separate_colour_plane、子层 DPB）只 infer 不写码流。VQ / PlayerX
+ * 语法面板依赖 trace 回调，不 emit 就会缺一整段。 */
+static void cbs_h265_trace_infer(CodedBitstreamContext *ctx,
+                                 GetBitContext *gbc,
+                                 const char *name,
+                                 int64_t value)
+{
+#if CBS_TRACE
+    if (ctx->trace_enable && ctx->trace_read_callback)
+        ctx->trace_read_callback(ctx->trace_context, gbc, 0,
+                                 name, NULL, value);
+#else
+    (void)ctx;
+    (void)gbc;
+    (void)name;
+    (void)value;
+#endif
+}
+
 #define infer(name, value) do { \
         current->name = value; \
+        cbs_h265_trace_infer(ctx, rw, #name, (int64_t)(current->name)); \
     } while (0)
 
 #define more_rbsp_data(var) ((var) = ff_cbs_h2645_read_more_rbsp_data(rw))
