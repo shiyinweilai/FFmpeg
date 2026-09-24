@@ -1342,17 +1342,18 @@ void ff_vvc_cu_snap_fill(const VVCLocalContext *lc, const CodingUnit *cu,
 
     /* Read MV directly from pu->mi (already set by inter_data/merge paths
      * before snap_fill is called, and before set_cu_tabs writes tab.mvf). */
-    if (cu->pred_mode == MODE_INTER || cu->pred_mode == MODE_IBC) {
-        const MvField *mi = &pu->mi;
+    if (cu->pred_mode == MODE_INTER || cu->pred_mode == MODE_SKIP ||
+        cu->pred_mode == MODE_IBC) {
+        const MotionInfo *mi = &pu->mi;
         ci->pred_flag     = mi->pred_flag;
         if (mi->pred_flag & PF_L0) {
-            ci->mv[0][0]   = mi->mv[L0].x;
-            ci->mv[0][1]   = mi->mv[L0].y;
+            ci->mv[0][0]   = mi->mv[L0][0].x;
+            ci->mv[0][1]   = mi->mv[L0][0].y;
             ci->ref_idx[0] = mi->ref_idx[L0];
         }
         if (mi->pred_flag & PF_L1) {
-            ci->mv[1][0]   = mi->mv[L1].x;
-            ci->mv[1][1]   = mi->mv[L1].y;
+            ci->mv[1][0]   = mi->mv[L1][0].x;
+            ci->mv[1][1]   = mi->mv[L1][0].y;
             ci->ref_idx[1] = mi->ref_idx[L1];
         }
     } else {

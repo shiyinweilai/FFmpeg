@@ -21,10 +21,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <string.h>
+
 #include "libavutil/container_fifo.h"
 #include "libavutil/mem.h"
 #include "libavutil/stereo3d.h"
 #include "libavutil/video_enc_params.h"   /* PlayerX: HEVC 块级划分导出 */
+#include "libavutil/codec_block_info.h"   /* PlayerX: Pred / MV */
 
 #include "libavcodec/decode.h"
 #include "hevc.h"
@@ -98,6 +101,13 @@ void ff_hevc_export_cu_partition(HEVCContext *s, const HEVCFrame *frame,
     }
     par->qp = frame_qp;
 
+    AVFrameSideData *cbsd = av_frame_new_side_data(
+        out, AV_FRAME_DATA_CODEC_BLOCK_INFO,
+        nb_blocks * (int)sizeof(AVCodecBlockInfo));
+    AVCodecBlockInfo *cb = cbsd ? (AVCodecBlockInfo *)cbsd->data : NULL;
+    if (cb)
+        memset(cb, 0, nb_blocks * sizeof(AVCodecBlockInfo));
+
     for (unsigned int i = 0; i < nb_blocks; i++) {
         const struct HEVCCUInfo *ci = &frame->cu_snap[i];
         AVVideoBlockParams *b = av_video_enc_params_block(par, i);
@@ -106,6 +116,26 @@ void ff_hevc_export_cu_partition(HEVCContext *s, const HEVCFrame *frame,
         b->w        = ci->w;
         b->h        = ci->h;
         b->delta_qp = have_qp && ci->qp >= 0 ? (ci->qp - frame_qp) : 0;
+
+        if (cb) {
+            AVCodecBlockInfo *o = &cb[i];
+            o->x          = ci->x;
+            o->y          = ci->y;
+            o->w          = ci->w;
+            o->h          = ci->h;
+            o->qp         = ci->qp >= 0 ? ci->qp : 0;
+            o->pred_mode  = ci->pred_mode;
+            o->pred_flag  = ci->pred_flag;
+            o->skip_flag  = ci->skip_flag;
+            o->qt_depth   = ci->depth;
+            o->tree_type  = 0;
+            o->ref_idx[0] = ci->ref_idx[0];
+            o->ref_idx[1] = ci->ref_idx[1];
+            o->mv[0][0]   = ci->mv[0][0];
+            o->mv[0][1]   = ci->mv[0][1];
+            o->mv[1][0]   = ci->mv[1][0];
+            o->mv[1][1]   = ci->mv[1][1];
+        }
     }
 }
 

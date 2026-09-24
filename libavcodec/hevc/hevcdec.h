@@ -387,6 +387,11 @@ typedef struct HEVCFrame {
         int16_t w, h;
         int8_t  depth;
         int8_t  qp;               ///< PlayerX: final luma QP (-1 = errored CU)
+        int8_t  pred_mode;        ///< MODE_INTER / MODE_INTRA / MODE_SKIP
+        int8_t  ref_idx[2];       ///< refIdxL0 / L1，未用为 -1
+        uint8_t pred_flag;        ///< PF_INTRA / L0 / L1 / BI
+        uint8_t skip_flag;        ///< cu_skip_flag
+        int16_t mv[2][2];         ///< [LX][x|y]，导出时已换成 1/16 像素
     } *cu_snap;
     int  nb_cu_snap;
     int  cu_snap_cap;

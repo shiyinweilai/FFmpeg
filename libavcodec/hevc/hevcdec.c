@@ -2478,6 +2478,12 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
             ci->h     = cb_size;
             ci->depth = sps->log2_ctb_size - log2_cb_size;
             ci->qp    = -1;
+            ci->pred_mode = MODE_INTRA;
+            ci->skip_flag = 0;
+            ci->pred_flag = 0;
+            ci->ref_idx[0] = ci->ref_idx[1] = -1;
+            ci->mv[0][0] = ci->mv[0][1] = 0;
+            ci->mv[1][0] = ci->mv[1][1] = 0;
             snap_idx  = hf->nb_cu_snap - 1;
         }
     }
@@ -2644,11 +2650,37 @@ static int hls_coding_unit(HEVCLocalContext *lc, const HEVCContext *s,
         x += min_cb_width;
     }
 
-    /* PlayerX: backfill the final luma QP into this CU's snapshot entry.
-     * lc->qp_y here is the QP actually written into qp_y_tab above. */
+    /* PlayerX: 回填 QP / Pred / MV。tab_mvf 此时已由 prediction_unit 写完。
+     * HEVC MV 是 1/4 像素，导出时 *4 对齐 AVCodecBlockInfo 的 1/16 像素。 */
     if (snap_idx >= 0 && s->cur_frame &&
-        s->cur_frame->cu_snap && snap_idx < s->cur_frame->nb_cu_snap)
-        s->cur_frame->cu_snap[snap_idx].qp = lc->qp_y;
+        s->cur_frame->cu_snap && snap_idx < s->cur_frame->nb_cu_snap) {
+        struct HEVCCUInfo *ci = &s->cur_frame->cu_snap[snap_idx];
+        ci->qp        = lc->qp_y;
+        ci->pred_mode = (int8_t)lc->cu.pred_mode;
+        ci->skip_flag = SAMPLE_CTB(l->skip_flag, x_cb, y_cb) ? 1 : 0;
+        ci->pred_flag = 0;
+        ci->ref_idx[0] = ci->ref_idx[1] = -1;
+        ci->mv[0][0] = ci->mv[0][1] = 0;
+        ci->mv[1][0] = ci->mv[1][1] = 0;
+        if (lc->cu.pred_mode != MODE_INTRA && s->cur_frame->tab_mvf) {
+            const int x_pu = x0 >> sps->log2_min_pu_size;
+            const int y_pu = y0 >> sps->log2_min_pu_size;
+            if (x_pu >= 0 && y_pu >= 0 && x_pu < sps->min_pu_width) {
+                const MvField *mf = &s->cur_frame->tab_mvf[y_pu * sps->min_pu_width + x_pu];
+                ci->pred_flag = (uint8_t)mf->pred_flag;
+                if (mf->pred_flag & PF_L0) {
+                    ci->mv[0][0]   = av_clip_int16(mf->mv[0].x * 4);
+                    ci->mv[0][1]   = av_clip_int16(mf->mv[0].y * 4);
+                    ci->ref_idx[0] = mf->ref_idx[0];
+                }
+                if (mf->pred_flag & PF_L1) {
+                    ci->mv[1][0]   = av_clip_int16(mf->mv[1].x * 4);
+                    ci->mv[1][1]   = av_clip_int16(mf->mv[1].y * 4);
+                    ci->ref_idx[1] = mf->ref_idx[1];
+                }
+            }
+        }
+    }
 
     if(((x0 + (1<<log2_cb_size)) & qp_block_mask) == 0 &&
        ((y0 + (1<<log2_cb_size)) & qp_block_mask) == 0) {
